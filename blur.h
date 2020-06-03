@@ -2,8 +2,7 @@
 #include <cairo.h>
 #include <xcb/xcb.h>
 
-void blur_image_gl(int scr, Pixmap pixmap, int width, int height, int radius,
-                   float sigma);
-void glx_init(int scr, int w, int h, int radius, float sigma);
+void post_process_pixmap(int screen, Pixmap pixmap, int width, int height);
+void glx_init(int screen, int w, int h);
 void glx_deinit(void);
 void glx_resize(int w, int h);

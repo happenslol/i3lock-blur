@@ -76,9 +76,8 @@ static char password[512];
 static bool beep = false;
 bool debug_mode = false;
 bool dpms_capable = false;
-bool unlock_indicator = true;
 char *modifier_string = NULL;
-static bool dont_fork = false;
+static bool should_fork = true;
 struct ev_loop *main_loop;
 static struct ev_timer *clear_auth_wrong_timeout;
 static struct ev_timer *clear_indicator_timeout;
@@ -89,9 +88,7 @@ int failed_attempts = 0;
 bool show_failed_attempts = false;
 bool retry_verification = false;
 
-static struct xkb_state *xkb_state;
-static struct xkb_context *xkb_context;
-static struct xkb_keymap *xkb_keymap;
+static struct xkb_state *xkb_state; static struct xkb_context *xkb_context; static struct xkb_keymap *xkb_keymap;
 static struct xkb_compose_table *xkb_compose_table;
 static struct xkb_compose_state *xkb_compose_state;
 static uint8_t xkb_base_event;
@@ -101,11 +98,8 @@ static int randr_base = -1;
 const xcb_query_extension_reply_t *dam_ext_data;
 
 cairo_surface_t *img = NULL;
-bool tile = false;
-bool fuzzy = false;
-bool once = false;
-int blur_radius = 0;
-float blur_sigma = 0;
+bool live = false;
+bool is_forked = false;
 bool ignore_empty_password = false;
 bool skip_repeated_empty_password = false;
 
@@ -367,8 +361,7 @@ static void input_done(void) {
     failed_attempts += 1;
     clear_input();
 
-    if (unlock_indicator)
-        redraw_unlock_indicator();
+    redraw_unlock_indicator();
 
     /* Clear this state after 2 seconds (unless the user enters another
      * password during that time). */
@@ -483,8 +476,7 @@ static void handle_key_press(xcb_key_press_event_t *event) {
                 DEBUG("C-u pressed\n");
                 clear_input();
                 /* Also hide the unlock indicator */
-                if (unlock_indicator)
-                    clear_indicator();
+                clear_indicator();
                 return;
             }
             break;
@@ -544,15 +536,13 @@ static void handle_key_press(xcb_key_press_event_t *event) {
     input_position += n - 1;
     DEBUG("current password = %.*s\n", input_position, password);
 
-    if (unlock_indicator) {
-        unlock_state = STATE_KEY_ACTIVE;
-        redraw_unlock_indicator();
-        unlock_state = STATE_KEY_PRESSED;
+    unlock_state = STATE_KEY_ACTIVE;
+    redraw_unlock_indicator();
+    unlock_state = STATE_KEY_PRESSED;
 
-        struct ev_timer *timeout = NULL;
-        START_TIMER(timeout, TSTAMP_N_SECS(0.25), redraw_timeout);
-        STOP_TIMER(clear_indicator_timeout);
-    }
+    struct ev_timer *timeout = NULL;
+    START_TIMER(timeout, TSTAMP_N_SECS(0.25), redraw_timeout);
+    STOP_TIMER(clear_indicator_timeout);
 
     START_TIMER(discard_passwd_timeout, TSTAMP_N_MINS(3), discard_passwd_cb);
 }
@@ -580,38 +570,43 @@ static void handle_visibility_notify(xcb_connection_t *conn,
  * Create a DAMAGE object to input/output class windows
  *
  */
-static void create_damage(xcb_connection_t *conn, xcb_window_t window,
-                          xcb_get_window_attributes_reply_t *win_attrib) {
-    if (win_attrib) {
-        if (win_attrib->_class != XCB_WINDOW_CLASS_INPUT_ONLY) {
-            xcb_damage_damage_t dam = xcb_generate_id(conn);
-            xcb_damage_create(conn, dam, window,
-                              XCB_DAMAGE_REPORT_LEVEL_NON_EMPTY);
-        }
-        free(win_attrib);
+static void create_damage(
+    xcb_connection_t *conn, xcb_window_t window,
+    xcb_get_window_attributes_reply_t *win_attrib
+) {
+    if (!win_attrib) return;
+
+    if (win_attrib->_class != XCB_WINDOW_CLASS_INPUT_ONLY) {
+        xcb_damage_damage_t dam = xcb_generate_id(conn);
+        xcb_damage_create(
+            conn, dam, window,
+            XCB_DAMAGE_REPORT_LEVEL_NON_EMPTY
+        );
     }
+
+    free(win_attrib);
 }
 
 static void handle_map_notify(xcb_map_notify_event_t *event) {
     maybe_close_sleep_lock_fd();
 
-    if (fuzzy && !once) {
+    if (live) {
         /* Create damage objects for new windows */
         xcb_get_window_attributes_reply_t *attribs =
             xcb_get_window_attributes_reply(
-                conn, xcb_get_window_attributes(conn, event->window), NULL);
+                conn,
+                xcb_get_window_attributes(conn, event->window),
+                NULL
+            );
+
         create_damage(conn, event->window, attribs);
     }
 
-    if (!dont_fork) {
-        /* After the first MapNotify, we never fork again. We don’t
-         * expect to get another MapNotify, but better be sure… */
-        dont_fork = true;
-
+    if (should_fork && !is_forked) {
         /* In the parent process, we exit */
-        if (fork() != 0)
-            exit(0);
+        if (fork() != 0) exit(0);
 
+        is_forked = true;
         ev_loop_fork(EV_DEFAULT);
     }
 }
@@ -705,36 +700,6 @@ void handle_screen_resize(void) {
     redraw_screen();
 }
 
-static bool verify_png_image(const char *image_path) {
-    if (!image_path) {
-        return false;
-    }
-
-    /* Check file exists and has correct PNG header */
-    FILE *png_file = fopen(image_path, "r");
-    if (png_file == NULL) {
-        fprintf(stderr, "Image file path \"%s\" cannot be opened: %s\n", image_path, strerror(errno));
-        return false;
-    }
-    unsigned char png_header[8];
-    memset(png_header, '\0', sizeof(png_header));
-    int bytes_read = fread(png_header, 1, sizeof(png_header), png_file);
-    fclose(png_file);
-    if (bytes_read != sizeof(png_header)) {
-        fprintf(stderr, "Could not read PNG header from \"%s\"\n", image_path);
-        return false;
-    }
-
-    // Check PNG header according to the specification, available at:
-    // https://www.w3.org/TR/2003/REC-PNG-20031110/#5PNG-file-signature
-    static unsigned char PNG_REFERENCE_HEADER[8] = { 137, 80, 78, 71, 13, 10, 26, 10 };
-    if (memcmp(PNG_REFERENCE_HEADER, png_header, sizeof(png_header)) != 0) {
-        fprintf(stderr, "File \"%s\" does not start with a PNG header. i3lock currently only supports loading PNG files.\n", image_path);
-        return false;
-    }
-    return true;
-}
-
 #ifndef __OpenBSD__
 /*
  * Callback function for PAM. We only react on password request callbacks.
@@ -791,8 +756,7 @@ static void xcb_prepare_cb(EV_P_ ev_prepare *w, int revents) {
  * child windows
  *
  */
-static void set_up_damage_notifications(xcb_connection_t *conn,
-                                        xcb_screen_t *scr) {
+static void set_up_damage_notifications(xcb_connection_t *conn, xcb_screen_t *scr) {
     xcb_damage_query_version_unchecked(conn, XCB_DAMAGE_MAJOR_VERSION,
                                        XCB_DAMAGE_MINOR_VERSION);
 
@@ -800,18 +764,17 @@ static void set_up_damage_notifications(xcb_connection_t *conn,
 
     xcb_query_tree_reply_t *reply =
         xcb_query_tree_reply(conn, xcb_query_tree(conn, scr->root), NULL);
+
     xcb_window_t *children = xcb_query_tree_children(reply);
     xcb_get_window_attributes_cookie_t *attribs =
         (xcb_get_window_attributes_cookie_t *)malloc(
             sizeof(xcb_get_window_attributes_cookie_t) * reply->children_len);
 
-    if (!attribs) {
-        errx(EXIT_FAILURE, "Failed to allocate memory");
-    }
+    if (!attribs) errx(EXIT_FAILURE, "Failed to allocate memory");
 
-    for (int i = 0; i < reply->children_len; ++i) {
+    for (int i = 0; i < reply->children_len; ++i)
         attribs[i] = xcb_get_window_attributes_unchecked(conn, children[i]);
-    }
+
     for (int i = 0; i < reply->children_len; ++i) {
         /* Get attributes to check if input-only window */
         xcb_get_window_attributes_reply_t *attrib =
@@ -819,6 +782,7 @@ static void set_up_damage_notifications(xcb_connection_t *conn,
 
         create_damage(conn, children[i], attrib);
     }
+
     free(attribs);
     free(reply);
 }
@@ -848,8 +812,7 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
     xcb_generic_event_t *event;
 
     if (xcb_connection_has_error(conn))
-        errx(EXIT_FAILURE,
-             "X11 connection broke, did your server terminate?\n");
+        errx(EXIT_FAILURE, "X11 connection broke, did your server terminate?\n");
 
     while ((event = xcb_poll_for_event(conn)) != NULL) {
         if (event->response_type == 0) {
@@ -857,28 +820,29 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
 
             /* Ignore errors when damage report is about destroyed window
              * or damage object is created for already destroyed window */
-            if (!once && error->major_code == dam_ext_data->major_opcode &&
+            if (live && error->major_code == dam_ext_data->major_opcode &&
                 (error->minor_code == XCB_DAMAGE_SUBTRACT ||
                  error->minor_code == XCB_DAMAGE_CREATE)) {
                 free(event);
                 continue;
             }
 
-            if (debug_mode)
-                fprintf(stderr, "X11 Error received! sequence 0x%x, error_code "
-                                "= %d, major = 0x%x, minor = 0x%x\n",
-                        error->sequence, error->error_code, error->major_code,
-                        error->minor_code);
+            if (error->error_code == 8) {
+              // TODO: Find out what this means
+              free(event);
+              continue;
+            }
+
+            if (debug_mode) fprintf(
+                stderr,
+                "X11 Error received! sequence 0x%x, error_code "
+                "= %d, major = 0x%x, minor = 0x%x\n",
+                error->sequence, error->error_code, error->major_code,
+                error->minor_code
+            );
+
             free(event);
             continue;
-        }
-
-        if (fuzzy && !once &&
-            event->response_type ==
-                dam_ext_data->first_event + XCB_DAMAGE_NOTIFY) {
-            xcb_damage_notify_event_t *ev = (xcb_damage_notify_event_t *)event;
-            xcb_damage_subtract(conn, ev->damage, XCB_NONE, XCB_NONE);
-            redraw_screen();
         }
 
         /* Strip off the highest bit (set if the event is generated) */
@@ -902,10 +866,17 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
                 handle_screen_resize();
                 break;
 
-            default:
-                if (type == xkb_base_event) {
-                    process_xkb_event(event);
+            case XCB_DAMAGE_NOTIFY:
+                if (live) {
+                    xcb_damage_notify_event_t *ev = (xcb_damage_notify_event_t *)event;
+                    xcb_damage_subtract(conn, ev->damage, XCB_NONE, XCB_NONE);
+                    redraw_screen();
                 }
+                break;
+
+            default:
+                if (type == xkb_base_event) process_xkb_event(event);
+
                 if (randr_base > -1 &&
                     type == randr_base + XCB_RANDR_SCREEN_CHANGE_NOTIFY) {
                     randr_query(screen->root);
@@ -974,22 +945,9 @@ static void raise_loop(xcb_window_t window) {
     }
 }
 
-static void init_blur_coefficents() {
-    if (blur_radius == 0 || blur_sigma == 0) {
-        double fact = last_resolution[1] / 100.0;
-        blur_radius = (int)fact / 2;
-        blur_sigma = fact / 2.0;
-        if (debug_mode) {
-            fprintf(stderr, "scaling factor = %f\tradius = %d\tsigma = %f\n",
-                    fact, blur_radius, blur_sigma);
-        }
-    }
-}
-
 int main(int argc, char *argv[]) {
     struct passwd *pw;
     char *username;
-    char *image_path = NULL;
 #ifndef __OpenBSD__
     int ret;
     struct pam_conv conv = {conv_callback, NULL};
@@ -1001,20 +959,11 @@ int main(int argc, char *argv[]) {
         {"version", no_argument, NULL, 'v'},
         {"nofork", no_argument, NULL, 'n'},
         {"beep", no_argument, NULL, 'b'},
-        {"dpms", no_argument, NULL, 'd'},
-        {"color", required_argument, NULL, 'c'},
         {"pointer", required_argument, NULL, 'p'},
         {"debug", no_argument, NULL, 0},
         {"help", no_argument, NULL, 'h'},
-        {"no-unlock-indicator", no_argument, NULL, 'u'},
-        {"image", required_argument, NULL, 'i'},
-        {"tiling", no_argument, NULL, 't'},
-        {"fuzzy", no_argument, NULL, 'f'},
-        {"once", no_argument, NULL, 'o'},
-        {"radius", required_argument, NULL, 'r'},
-        {"sigma", required_argument, NULL, 's'},
+        {"live", no_argument, NULL, 'L'},
         {"ignore-empty-password", no_argument, NULL, 'e'},
-        {"inactivity-timeout", required_argument, NULL, 'I'},
         {"show-failed-attempts", no_argument, NULL, 'l'},
         {NULL, no_argument, NULL, 0}};
 
@@ -1023,58 +972,19 @@ int main(int argc, char *argv[]) {
     if ((username = pw->pw_name) == NULL)
         errx(EXIT_FAILURE, "pw->pw_name is NULL.\n");
 
-    char *optstring = "hvnbdc:op:ui:tfr:s:eI:l";
+    char *optstring = "hvnbLp:el";
     while ((o = getopt_long(argc, argv, optstring, longopts, &longoptind)) != -1) {
         switch (o) {
             case 'v':
                 errx(EXIT_SUCCESS, "version " I3LOCK_VERSION " © 2010 Michael Stapelberg");
             case 'n':
-                dont_fork = true;
+                should_fork = false;
                 break;
             case 'b':
                 beep = true;
                 break;
-            case 'd':
-                fprintf(stderr, "DPMS support has been removed from i3lock. "
-                                "Please see the manpage i3lock(1).\n");
-                break;
-            case 'I': {
-                fprintf(stderr, "Inactivity timeout only makes sense with DPMS, which was removed. Please see the manpage i3lock(1).\n");
-                break;
-            }
-            case 'c': {
-                char *arg = optarg;
-
-                /* Skip # if present */
-                if (arg[0] == '#')
-                    arg++;
-
-                if (strlen(arg) != 6 ||
-                    sscanf(arg, "%06[0-9a-fA-F]", color) != 1)
-                    errx(EXIT_FAILURE, "color is invalid, it must be given in "
-                                       "3-byte hexadecimal format: rrggbb\n");
-                break;
-            }
-            case 'u':
-                unlock_indicator = false;
-                break;
-            case 'i':
-                image_path = strdup(optarg);
-                break;
-            case 't':
-                tile = true;
-                break;
-            case 'f':
-                fuzzy = true;
-                break;
-            case 'r':
-                sscanf(optarg, "%d", &blur_radius);
-                break;
-            case 's':
-                sscanf(optarg, "%f", &blur_sigma);
-                break;
-            case 'o':
-                once = true;
+            case 'L':
+                live = true;
                 break;
             case 'p':
                 if (!strcmp(optarg, "win")) {
@@ -1098,10 +1008,9 @@ int main(int argc, char *argv[]) {
                 show_failed_attempts = true;
                 break;
             default:
-                errx(EXIT_FAILURE, "Syntax: i3lock [-v] [-n] [-b] [-d] [-c "
-                                   "color] [-u] [-p win|default]"
-                                   " [-i image.png] [-t] [-f] [-r radius] [-s "
-                                   "sigma] [-e] [-I timeout] [-l]");
+                errx(EXIT_FAILURE, "Syntax: i3lock [-v] [-n] [-b] [-d] "
+                                   "[-p win|default] [-L]"
+                                   "[-e] [-I timeout] [-l]");
         }
     }
 
@@ -1195,47 +1104,31 @@ int main(int argc, char *argv[]) {
     last_resolution[0] = screen->width_in_pixels;
     last_resolution[1] = screen->height_in_pixels;
 
-    xcb_change_window_attributes(conn, screen->root, XCB_CW_EVENT_MASK,
-                                 (uint32_t[]){XCB_EVENT_MASK_STRUCTURE_NOTIFY});
-
-    if (verify_png_image(image_path) && !fuzzy) {
-        /* Create a pixmap to render on, fill it with the background color */
-        img = cairo_image_surface_create_from_png(image_path);
-        /* In case loading failed, we just pretend no -i was specified. */
-        if (cairo_surface_status(img) != CAIRO_STATUS_SUCCESS) {
-            fprintf(stderr, "Could not load image \"%s\": %s\n", image_path,
-                    cairo_status_to_string(cairo_surface_status(img)));
-            img = NULL;
-        }
-    }
-    free(image_path);
-
-    if (fuzzy) {
-        init_blur_coefficents();
-    }
+    xcb_change_window_attributes(
+        conn, screen->root, XCB_CW_EVENT_MASK,
+        (uint32_t[]){XCB_EVENT_MASK_STRUCTURE_NOTIFY}
+    );
 
     /* Pixmap on which the image is rendered to (if any) */
     xcb_pixmap_t bg_pixmap = draw_image(last_resolution);
 
     /* For once, store the blurred background as img */
-    if (fuzzy & once) {
-        blur_image_gl(0, bg_pixmap, last_resolution[0], last_resolution[1],
-                      blur_radius, blur_sigma);
-        img = cairo_xcb_surface_create(conn, bg_pixmap,
-                                       get_root_visual_type(screen),
-                                       last_resolution[0], last_resolution[1]);
+    if (!live) {
+        img = cairo_xcb_surface_create(
+            conn, bg_pixmap,
+            get_root_visual_type(screen),
+            last_resolution[0], last_resolution[1]
+        );
+
         bg_pixmap = draw_image(last_resolution);
     }
 
     xcb_window_t stolen_focus = XCB_NONE;
 
     /* open the fullscreen window, already with the correct pixmap in place */
-    if (fuzzy && !once) {
-        win = open_overlay_window(conn, screen);
-    } else {
-        stolen_focus = find_focused_window(conn, screen->root);
-        win = open_fullscreen_window(conn, screen, color, bg_pixmap);
-    }
+    stolen_focus = find_focused_window(conn, screen->root);
+    win = open_fullscreen_window(conn, screen, color, bg_pixmap);
+
     xcb_free_pixmap(conn, bg_pixmap);
 
     cursor = create_cursor(conn, screen, win, curs_choice);
@@ -1251,7 +1144,11 @@ int main(int argc, char *argv[]) {
          * We cannot use set_focused_window because _NET_ACTIVE_WINDOW only
          * works for managed windows, but i3lock uses an unmanaged window
          * (override_redirect=1). */
-        xcb_set_input_focus(conn, XCB_INPUT_FOCUS_PARENT /* revert_to */, win, XCB_CURRENT_TIME);
+        xcb_set_input_focus(
+            conn, XCB_INPUT_FOCUS_PARENT /* revert_to */,
+            win, XCB_CURRENT_TIME
+        );
+
         if (!grab_pointer_and_keyboard(conn, screen, cursor, 9000)) {
             auth_state = STATE_I3LOCK_LOCK_FAILED;
             redraw_screen();
@@ -1261,21 +1158,20 @@ int main(int argc, char *argv[]) {
     }
 
     maybe_close_sleep_lock_fd();
-    if (fuzzy && !once) {
-        /* Set up damage notifications */
-        set_up_damage_notifications(conn, screen);
-    } else {
-        pid_t pid = fork();
-        /* The pid == -1 case is intentionally ignored here:
-         * While the child process is useful for preventing other windows from
-         * popping up while i3lock blocks, it is not critical. */
-        if (pid == 0) {
-            /* Child */
-            close(xcb_get_file_descriptor(conn));
-            raise_loop(win);
-            exit(EXIT_SUCCESS);
-        }
+    pid_t pid = fork();
+
+    /* The pid == -1 case is intentionally ignored here:
+     * While the child process is useful for preventing other windows from
+     * popping up while i3lock blocks, it is not critical. */
+    if (pid == 0) {
+        /* Child */
+        close(xcb_get_file_descriptor(conn));
+        raise_loop(win);
+        exit(EXIT_SUCCESS);
     }
+
+    /* Set up damage notifications */
+    if (live) set_up_damage_notifications(conn, screen);
 
     /* Load the keymap again to sync the current modifier state. Since we first
      * loaded the keymap, there might have been changes, but starting from now,
@@ -1296,8 +1192,7 @@ int main(int argc, char *argv[]) {
     struct ev_check *xcb_check = calloc(sizeof(struct ev_check), 1);
     struct ev_prepare *xcb_prepare = calloc(sizeof(struct ev_prepare), 1);
 
-    ev_io_init(xcb_watcher, xcb_got_event, xcb_get_file_descriptor(conn),
-               EV_READ);
+    ev_io_init(xcb_watcher, xcb_got_event, xcb_get_file_descriptor(conn), EV_READ);
     ev_io_start(main_loop, xcb_watcher);
 
     ev_check_init(xcb_check, xcb_check_cb);
@@ -1310,24 +1205,26 @@ int main(int argc, char *argv[]) {
      * received up until now. ev will only pick up new events (when the X11
      * file descriptor becomes readable). */
     ev_invoke(main_loop, xcb_check, 0);
+
     /* usually fork is called from mapnotify event handler, but in our case
      * a new window is not created and so the mapnotify event doesn't come */
-    if (fuzzy && !dont_fork) {
-        dont_fork = true;
-
+    if (should_fork && !is_forked) {
         /* In the parent process, we exit */
-        if (fork() != 0)
-            exit(0);
+        if (fork() != 0) exit(0);
 
+        is_forked = true;
         ev_loop_fork(EV_DEFAULT);
     }
+
+    glx_init(0, last_resolution[0], last_resolution[1]);
+    redraw_screen();
+
     ev_loop(main_loop, 0);
 
-    if (fuzzy) {
-        glx_deinit();
-    }
+    glx_deinit();
 
     if (stolen_focus == XCB_NONE) {
+        DEBUG("quitting without restoring focus\n");
         return 0;
     }
 
@@ -1338,5 +1235,6 @@ int main(int argc, char *argv[]) {
     set_focused_window(conn, screen->root, stolen_focus);
     xcb_aux_sync(conn);
 
+    DEBUG("returning after restoring focus\n");
     return 0;
 }

@@ -178,62 +178,120 @@ xcb_pixmap_t create_bg_pixmap(xcb_connection_t *conn, xcb_screen_t *scr,
 xcb_window_t open_overlay_window(xcb_connection_t *conn, xcb_screen_t *scr) {
     xcb_composite_query_version_reply_t *ver_reply =
         xcb_composite_query_version_reply(
-            conn, xcb_composite_query_version(conn, XCB_COMPOSITE_MAJOR_VERSION,
-                                              XCB_COMPOSITE_MINOR_VERSION),
-            NULL);
+            conn, xcb_composite_query_version(
+                conn, XCB_COMPOSITE_MAJOR_VERSION,
+                XCB_COMPOSITE_MINOR_VERSION
+            ),
+            NULL
+        );
+
     xcb_composite_get_overlay_window_reply_t *comp_win_reply =
         xcb_composite_get_overlay_window_reply(
-            conn, xcb_composite_get_overlay_window(conn, scr->root), NULL);
+            conn, xcb_composite_get_overlay_window(conn, scr->root), NULL
+        );
 
     xcb_window_t win = comp_win_reply->overlay_win;
     free(ver_reply);
     free(comp_win_reply);
 
-    xcb_composite_redirect_subwindows(conn, scr->root,
-                                      XCB_COMPOSITE_REDIRECT_AUTOMATIC);
+    xcb_composite_redirect_subwindows(
+        conn, scr->root,
+        XCB_COMPOSITE_REDIRECT_AUTOMATIC
+    );
 
     xcb_change_window_attributes(
         conn, scr->root, XCB_CW_EVENT_MASK,
-        (uint32_t[1]){XCB_EVENT_MASK_STRUCTURE_NOTIFY |
-                      XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY});
+        (uint32_t[1]){
+            XCB_EVENT_MASK_STRUCTURE_NOTIFY |
+            XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY
+        });
 
     return win;
 }
 
-xcb_window_t open_fullscreen_window(xcb_connection_t *conn, xcb_screen_t *scr,
-                                    char *color, xcb_pixmap_t pixmap) {
+xcb_window_t open_fullscreen_window(
+    xcb_connection_t *conn, xcb_screen_t *scr,
+    char *color, xcb_pixmap_t pixmap
+) {
     uint32_t mask = 0;
     uint32_t values[3];
     xcb_window_t win = xcb_generate_id(conn);
+    xcb_window_t parent_win = scr->root;
 
-    if (pixmap == XCB_NONE) {
-        mask |= XCB_CW_BACK_PIXEL;
-        values[0] = get_colorpixel(color);
-    } else {
-        mask |= XCB_CW_BACK_PIXMAP;
-        values[0] = pixmap;
+    /* Check whether the composite extension is available */
+    const xcb_query_extension_reply_t *extension_query = NULL;
+    xcb_generic_error_t *error = NULL;
+    xcb_composite_get_overlay_window_cookie_t cookie;
+    xcb_composite_get_overlay_window_reply_t *composite_reply = NULL;
+
+    extension_query = xcb_get_extension_data(conn, &xcb_composite_id);
+    if (extension_query && extension_query->present) {
+        /* When composition is used, we need to use the composite overlay
+         * window instead of the normal root window to be able to cover
+         * composited windows */
+        cookie = xcb_composite_get_overlay_window(conn, scr->root);
+        composite_reply = xcb_composite_get_overlay_window_reply(
+            conn, cookie, &error
+        );
+
+        if (!error && composite_reply) {
+            parent_win = composite_reply->overlay_win;
+        }
+
+        free(composite_reply);
+        free(error);
     }
+
+    mask |= XCB_CW_BACK_PIXMAP;
+    values[0] = pixmap;
 
     mask |= XCB_CW_OVERRIDE_REDIRECT;
     values[1] = 1;
 
     mask |= XCB_CW_EVENT_MASK;
-    values[2] = XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_KEY_PRESS |
-                XCB_EVENT_MASK_KEY_RELEASE | XCB_EVENT_MASK_VISIBILITY_CHANGE |
+    values[2] = XCB_EVENT_MASK_EXPOSURE |
+                XCB_EVENT_MASK_KEY_PRESS |
+                XCB_EVENT_MASK_KEY_RELEASE |
+                XCB_EVENT_MASK_VISIBILITY_CHANGE |
                 XCB_EVENT_MASK_STRUCTURE_NOTIFY;
 
     xcb_create_window(
-        conn, XCB_COPY_FROM_PARENT, win,                   /* the window id */
-        scr->root,                                         /* parent == root */
-        0, 0, scr->width_in_pixels, scr->height_in_pixels, /* dimensions */
-        0, /* border = 0, we draw our own */
+        conn,
+        XCB_COPY_FROM_PARENT,
+        win, /* the window id */
+        parent_win,
+        0, 0,
+        scr->width_in_pixels,
+        scr->height_in_pixels, /* dimensions */
+        0,                     /* border = 0, we draw our own */
         XCB_WINDOW_CLASS_INPUT_OUTPUT,
         XCB_WINDOW_CLASS_COPY_FROM_PARENT, /* copy visual from parent */
-        mask, values);
+        mask,
+        values
+    );
 
     char *name = "i3lock";
-    xcb_change_property(conn, XCB_PROP_MODE_REPLACE, win, XCB_ATOM_WM_NAME,
-                        XCB_ATOM_STRING, 8, strlen(name), name);
+    xcb_change_property(
+        conn,
+        XCB_PROP_MODE_REPLACE,
+        win,
+        XCB_ATOM_WM_NAME,
+        XCB_ATOM_STRING,
+        8,
+        strlen(name),
+        name
+    );
+
+    xcb_change_property(
+        conn,
+        XCB_PROP_MODE_REPLACE,
+        win,
+        XCB_ATOM_WM_CLASS,
+        XCB_ATOM_STRING,
+        8,
+        2 * (strlen("i3lock") + 1),
+        "i3lock\0i3lock\0"
+    );
 
     /* Map the window (= make it visible) */
     xcb_map_window(conn, win);
@@ -255,7 +313,10 @@ xcb_window_t open_fullscreen_window(xcb_connection_t *conn, xcb_screen_t *scr,
  * Returns true if the grab succeeded, false if not.
  *
  */
-bool grab_pointer_and_keyboard(xcb_connection_t *conn, xcb_screen_t *screen, xcb_cursor_t cursor, int tries) {
+bool grab_pointer_and_keyboard(
+    xcb_connection_t *conn, xcb_screen_t *screen,
+    xcb_cursor_t cursor, int tries
+) {
     xcb_grab_pointer_cookie_t pcookie;
     xcb_grab_pointer_reply_t *preply;
 
